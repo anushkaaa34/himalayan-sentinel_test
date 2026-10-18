@@ -18,6 +18,27 @@
 #mapStatus{position:absolute;top:14px;left:14px;right:14px;z-index:600;display:none;background:#201d16eF;border:1px solid #59452d;border-radius:9px;padding:10px 12px;color:#f0c98f;font-size:11px;line-height:1.5}
 .eval-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:17px 18px}.eval-metric{border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:12px}.eval-metric strong{display:block;font-size:20px;margin-top:6px}.eval-metric span{font-size:10px;color:var(--muted)}.eval-note{padding:0 18px 16px;color:#d9bd96;font-size:11px;line-height:1.6}.demo-notice{background:#242017;border-color:#927243;color:#ffe0a5}
 @media(max-width:1000px){.layout{grid-template-columns:1fr}.rightcol{grid-template-columns:1fr 1fr}.rightcol .panel:first-child{grid-row:span 2}#map{height:440px}.hero{align-items:start;flex-direction:column}.hero-meta{text-align:left}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){.shell{padding:15px}.top{align-items:flex-start}.topright{flex-direction:column;align-items:flex-end}.rightcol{grid-template-columns:1fr}.rightcol .panel:first-child{grid-row:auto}.stats{gap:8px}.stat{padding:13px}.stat .value{font-size:22px}.panel-head{padding:14px}.map-controls{flex-wrap:wrap}#map{height:390px}.foot{flex-direction:column;gap:4px}}
+
+.history-search{width:calc(100% - 36px);margin:12px 18px 3px;padding:9px 11px;background:#0d171a;border:1px solid var(--line);border-radius:8px;color:var(--text);font:11px Manrope,sans-serif;outline:none}
+.event{grid-template-columns:74px minmax(0,1fr);align-items:start}
+.event-meta{overflow-wrap:anywhere;line-height:1.65}
+.event-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.event-action-btn{border:1px solid #45615c;background:#1c322e;color:var(--mint);border-radius:7px;padding:6px 9px;font-size:10px;font-weight:800}
+.event-action-btn.gemini{background:#1c2a35;border-color:#3c617c;color:var(--blue)}
+.event-action-btn:disabled{opacity:.45;cursor:not-allowed}
+.assessment-inner{padding:16px 18px 20px}
+.assessment-status{font-size:11px;line-height:1.7;color:var(--muted);padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:#0d171a;margin-bottom:12px;white-space:pre-wrap}
+.assessment-assets{display:grid;gap:8px}
+.assessment-asset{padding:11px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px}
+.assessment-asset-head{display:flex;justify-content:space-between;gap:8px;align-items:start}
+.assessment-asset strong{font-size:11px;line-height:1.5}
+.assessment-asset p{font-size:10px;color:#b9c9c7;line-height:1.65;margin:7px 0 0;overflow-wrap:anywhere}
+.priority-pill{font-size:9px;border:1px solid #574833;color:var(--orange);border-radius:6px;padding:4px 6px;white-space:nowrap}
+.report-section{border-top:1px solid var(--line);margin-top:15px;padding-top:13px}
+.report-section h4{font-size:11px;margin:0 0 7px;color:var(--mint)}
+.report-section p,.report-section li{font-size:11px;line-height:1.7;color:#c3d2d0}
+.report-section ul{margin:5px 0;padding-left:18px}
+.event-empty{padding:14px 0;color:var(--muted);font-size:11px}
 </style></head>
 <body><div class="shell">
 <header class="top"><div class="brand"><div class="mark">⌁</div><div><div class="eyebrow">Himalayan Sentinel / Research build</div><h1>Hazard Intelligence</h1><div class="subtitle">Environmental observations · experimental scores · analyst synthesis</div></div></div><div class="topright"><div class="livepill"><span class="dot"></span><span id="modeBadge">LIVE DATA PIPELINE</span></div><button class="btn secondary" id="showDemo">Offline demo</button><button class="btn" id="refresh">↻ Refresh data</button></div></header>
@@ -28,7 +49,8 @@
 <section class="panel" style="margin-bottom:15px"><div class="panel-head"><div><h3>Retrospective model check</h3><p>Saved model evaluated on the dataset’s predefined, pair-grouped test split.</p></div><span class="eyebrow">NOT LIVE VALIDATION</span></div><div class="eval-grid"><div class="eval-metric"><span>ROC AUC · 95% pair-bootstrap CI</span><strong id="evalAuc">Loading…</strong></div><div class="eval-metric"><span>Average precision · matched sample</span><strong id="evalAp">—</strong></div><div class="eval-metric"><span>Recall at illustrative 0.50 cutoff</span><strong id="evalRecall">—</strong></div><div class="eval-metric"><span>Test examples · matched pairs</span><strong id="evalSize">—</strong></div></div><div class="eval-note" id="evalNote">Evaluation metrics are descriptive only.</div></section>
 <div class="layout"><main>
 <section class="panel"><div class="panel-head"><div><h3>Himalayan field map</h3><p>Toggle layers to separate past reports from current model outputs.</p></div><div class="map-controls"><button class="chip active" id="showLive">Live scores</button><button class="chip active" id="showHistory">Historical</button></div></div><div class="mapwrap"><div id="map"></div><div id="mapStatus" role="status"></div><div class="mapkey"><div class="keyrow"><span class="keydot" style="background:#a8f0c6"></span> Lower model score</div><div class="keyrow"><span class="keydot" style="background:#ffb36b"></span> Raised model score</div><div class="keyrow"><span class="keydot" style="background:#ff7777"></span> High model score</div><div class="keyrow"><span class="keydot" style="background:#82c7ef"></span> Historical report</div></div></div></section>
-<section class="panel history"><div class="panel-head"><div><h3>Historical incident register</h3><p>Past event candidates from the supplied master dataset · not predictions.</p></div><select id="years" class="chip"><option value="5">Last 5 years</option><option value="10" selected>Last 10 years</option><option value="20">Last 20 years</option></select></div><div class="historybody" id="historyList"><div class="loading">Loading historical records…</div></div></section>
+<section class="panel history"><div class="panel-head"><div><h3>Historical incident register</h3><p>Past event candidates from the supplied master dataset · not predictions.</p></div><select id="years" class="chip"><option value="5">Last 5 years</option><option value="10" selected>Last 10 years</option><option value="20">Last 20 years</option><option value="100">All available years</option></select></div><input id="historySearch" class="history-search" placeholder="Search event title, ID, hazard, country…"><div class="historybody" id="historyList"><div class="loading">Loading historical records…</div></div></section>
+<section class="panel history" id="eventAssessmentPanel"><div class="panel-head"><div><h3>Event impact assessment</h3><p>Run Stage 2 and Gemini separately for each selected event. Each Stage 2 click makes at most one Places request; cached results are reused.</p></div><span class="eyebrow">STAGE 2 + 3</span></div><div class="assessment-inner"><div class="assessment-status" id="assessmentStatus">Choose “Stage 2” beside a historical event to retrieve nearby Google Places and calculate distance-based screening. Then choose “Gemini” to generate an evidence-grounded situation report.</div><div id="stage2Summary"></div><div id="stage2Assets" class="assessment-assets"></div><div id="eventGeminiReport"></div></div></section>
 </main><aside class="rightcol"><section class="panel"><div class="panel-head"><div><h3 id="watchlistTitle">Live model watchlist</h3><p id="watchlistSubtitle">Ranked by model score · 28-day environmental window.</p></div><span class="eyebrow">XGBoost</span></div><div class="feed" id="siteList"><div class="loading">Fetching environmental history…</div></div></section>
 <section class="panel"><div class="panel-head"><div><h3>Gemini analyst brief</h3><p id="geminiSubtitle">Narrative summary only; it does not change model scores.</p></div><span class="eyebrow">Gemini Flash</span></div><div class="ai-body"><div class="ai-tag">GENERATIVE SYNTHESIS</div><div class="ai-text" id="aiText">Refresh the data, then ask Gemini to summarize the returned model outputs. Add your Gemini API key to enable this panel.</div><button class="btn secondary" id="summarize" style="margin-top:14px">Generate analyst brief ↗</button></div></section></aside></div>
 <footer class="foot"><span>Sources: Google Earth Engine ERA5-Land + CHIRPS · user-supplied master dataset · supplied XGBoost artifact · Gemini API (optional).</span><span id="status">Initializing…</span></footer>
@@ -37,7 +59,7 @@
 <script>
 // Google Maps JavaScript API requires an API key, supplied by the server at page render time.
 const GOOGLE_MAPS_API_KEY = 'YOUR_GOOGLE_MAPS_API_KEY';
-let map=null, liveMarkers=[], historyMarkers=[], liveData=[],historyData=[],liveVisible=true,histVisible=true,demoModeActive=false;
+let map=null, liveMarkers=[], historyMarkers=[], stage2Markers=[], liveData=[],historyData=[],liveVisible=true,histVisible=true,demoModeActive=false, selectedAssessmentId=null, eventStage2Cache={}, stage2StatusByEvent={}, stage2StatusRequestToken=0;
 let googleMapReady=false;
 function initGoogleMap(){
   if(!window.google || !google.maps){showMapError('Google Maps failed to load. Check that Maps JavaScript API is enabled and the browser key is valid.');return;}
@@ -85,8 +107,42 @@ function renderHistory(){
 }
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function renderSites(){const root=document.getElementById('siteList');if(!liveData.length){root.innerHTML='<div class="loading">No scores returned. Check provider availability and server logs.</div>';return}const sorted=[...liveData].sort((a,b)=>b.score-a.score);root.innerHTML=sorted.map(s=>`<div class="site"><div><div class="site-name">${esc(s.name)}</div><div class="site-sub">${esc(s.region)} · ${s.as_of?`data date ${esc(s.as_of)}`:`${s.valid_days}/28 temperature days`}</div><div class="bar"><span style="width:${Math.max(2,Math.min(100,s.score*100))}%;background:${scoreColor(s.score)}"></span></div></div><div class="score" style="color:${scoreColor(s.score)}">${fmtPct(s.score)}<small>${esc(s.band)}</small></div></div>`).join('')}
-function renderHistoryList(){const root=document.getElementById('historyList');root.innerHTML=historyData.slice(0,70).map(e=>`<div class="event"><div class="event-date">${esc(e.date)}</div><div><div class="event-title">${esc(e.title)}</div><div class="event-meta">${esc(e.country)} · ${esc(e.source)} · ${esc(e.quality)} ${e.url?`· <a class="source-link" target="_blank" rel="noreferrer" href="${esc(e.url)}">source ↗</a>`:''}</div></div></div>`).join('')||'<div class="loading">No historical records found in this date range.</div>'}
-async function fetchHistory(){const y=document.getElementById('years').value;const r=await fetch('/api/history?years='+y);const d=await r.json();historyData=d.items||[];document.getElementById('eventCount').textContent=(d.count||0).toLocaleString();renderHistory();renderHistoryList()}
+function renderHistoryList(){
+  const root=document.getElementById('historyList');
+  const query=(document.getElementById('historySearch')?.value||'').trim().toLowerCase();
+  const filtered=historyData.filter(e=>[e.id,e.sample_id,e.title,e.hazard_type,e.country,e.source,e.date].join(' ').toLowerCase().includes(query));
+  root.innerHTML=filtered.map(e=>{
+    const sampleId=String(e.sample_id||e.id||'');
+    const stage2Ready=Boolean(eventStage2Cache[sampleId]) || stage2StatusByEvent[sampleId]===true;
+    const status=stage2StatusByEvent[sampleId];
+    const geminiLabel=stage2Ready?'Gemini report':(status===undefined||status===null?'Checking saved result…':'Generate Stage 2 first');
+    const geminiTitle=stage2Ready?'Generate a Gemini report from saved Stage 2 calculations':(status===undefined||status===null?'Checking whether this event already has a saved Stage 2 result':'Run Stage 2 first; Gemini requires its saved calculations');
+    return `<div class="event"><div class="event-date">${esc(e.date)}</div><div><div class="event-title">${esc(e.title)}</div><div class="event-meta">${esc(e.hazard_type||'unknown hazard')} · ${esc(e.country)} · ${esc(e.source)} · ${esc(e.quality)} ${e.url?`· <a class="source-link" target="_blank" rel="noreferrer" href="${esc(e.url)}">source ↗</a>`:''}</div><div class="event-actions"><button type="button" class="event-action-btn" data-event-action="stage2" data-sample-id="${esc(sampleId)}">Stage 2 · Nearby places</button><button type="button" class="event-action-btn gemini" data-event-action="gemini" data-sample-id="${esc(sampleId)}" title="${esc(geminiTitle)}" ${stage2Ready?'':'disabled'}>${geminiLabel}</button></div></div></div>`;
+  }).join('')||'<div class="event-empty">No matching event records.</div>';
+}
+function rerenderHistoryListPreservingScroll(){const root=document.getElementById('historyList');const y=root.scrollTop;renderHistoryList();root.scrollTop=y;}
+async function loadStage2Statuses(){
+  const ids=[...new Set(historyData.map(e=>String(e.sample_id||e.id||'')).filter(Boolean))];
+  const token=++stage2StatusRequestToken;
+  stage2StatusByEvent={};
+  ids.forEach(id=>{stage2StatusByEvent[id]=null;});
+  rerenderHistoryListPreservingScroll();
+  if(!ids.length)return;
+  try{
+    const r=await fetch('/api/events/assessment-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sample_ids:ids})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||`Saved-result status check failed (HTTP ${r.status})`);
+    if(token!==stage2StatusRequestToken)return;
+    (d.items||[]).forEach(item=>{stage2StatusByEvent[item.sample_id]=item.stage2_available===true || Boolean(eventStage2Cache[item.sample_id]);});
+    ids.forEach(id=>{if(stage2StatusByEvent[id]===null)stage2StatusByEvent[id]=false;});
+  }catch(err){
+    if(token!==stage2StatusRequestToken)return;
+    console.warn('Could not check cached Stage 2 status',err);
+    ids.forEach(id=>{stage2StatusByEvent[id]=Boolean(eventStage2Cache[id]);});
+  }
+  rerenderHistoryListPreservingScroll();
+}
+async function fetchHistory(){const y=document.getElementById('years').value;const r=await fetch('/api/history?years='+y);if(!r.ok)throw new Error(`History endpoint returned HTTP ${r.status}`);const d=await r.json();historyData=d.items||[];document.getElementById('eventCount').textContent=(d.count||0).toLocaleString();renderHistory();renderHistoryList();loadStage2Statuses();}
 function applyLiveResponse(d){liveData=d.results||[];demoModeActive=d.mode==='demo_replay';document.getElementById('modeBadge').textContent=demoModeActive?'OFFLINE DEMO REPLAY':'LIVE DATA PIPELINE';document.getElementById('siteCountLabel').textContent=demoModeActive?'Historical examples in replay':'Monitoring sites scored';document.getElementById('watchlistTitle').textContent=demoModeActive?'Offline historical replay examples':'Live model watchlist';document.getElementById('watchlistSubtitle').textContent=demoModeActive?'Historical test-split examples · not current conditions.':'Ranked by model score · 28-day environmental window.';document.getElementById('geminiSubtitle').textContent=demoModeActive?'Summarizes historical test-split examples only—not current conditions.':'Narrative summary only; it does not change model scores.';document.getElementById('demoNotice').hidden=!demoModeActive;if(demoModeActive)document.getElementById('demoNotice').textContent=`OFFLINE DEMO REPLAY — ${d.note} The examples are dated ${[...liveData].map(x=>x.as_of).sort()[0]} to ${[...liveData].map(x=>x.as_of).sort().at(-1)}.`;renderLive();renderSites();document.getElementById('siteCount').textContent=liveData.length;document.getElementById('maxScore').textContent=liveData.length?fmtPct(Math.max(...liveData.map(x=>x.score))):'—';document.getElementById('completeness').textContent=liveData.length?Math.round(100*liveData.reduce((a,x)=>a+(Number(x.data_completeness)||0),0)/liveData.length)+'%':'—';document.getElementById('asof').textContent=demoModeActive?'Historical test-split examples · not current':liveData.length?`Through ${liveData.map(x=>x.as_of).sort().at(-1)}`:'Provider unavailable';if(d.errors?.length)console.warn('Live data errors',d.errors)}
 async function refresh(){document.getElementById('status').textContent='Fetching 28-day environmental windows…';document.getElementById('refresh').disabled=true;document.getElementById('refresh').textContent='Refreshing…';try{await fetchHistory();const r=await fetch('/api/live');if(!r.ok)throw new Error(`Live endpoint returned HTTP ${r.status}`);const d=await r.json();applyLiveResponse(d);document.getElementById('status').textContent=d.mode==='demo_replay'?'Live providers unavailable · offline replay shown':`Updated ${new Date().toLocaleTimeString()} · ${d.errors?.length||0} provider/site issues`}catch(e){document.getElementById('status').textContent='Refresh failed: '+e.message}finally{document.getElementById('refresh').disabled=false;document.getElementById('refresh').textContent='↻ Refresh data'}}
 async function showDemoReplay(){const button=document.getElementById('showDemo');button.disabled=true;try{const r=await fetch('/api/demo-replay');if(!r.ok)throw new Error(`Demo replay endpoint returned HTTP ${r.status}`);applyLiveResponse(await r.json());document.getElementById('status').textContent='Offline demonstration data · historical test examples'}catch(e){document.getElementById('status').textContent='Could not load offline demo: '+e.message}finally{button.disabled=false}}
@@ -95,6 +151,85 @@ async function loadEvaluation(){try{const r=await fetch('/api/evaluation');if(!r
 document.getElementById('refresh').onclick=refresh;document.getElementById('years').onchange=fetchHistory;
 document.getElementById('showLive').onclick=()=>{liveVisible=!liveVisible;document.getElementById('showLive').classList.toggle('active',liveVisible);renderLive()};
 document.getElementById('showHistory').onclick=()=>{histVisible=!histVisible;document.getElementById('showHistory').classList.toggle('active',histVisible);renderHistory()};
+function clearStage2Markers(){stage2Markers.forEach(m=>m.setMap(null));stage2Markers=[];}
+function setAssessmentStatus(message){document.getElementById('assessmentStatus').textContent=message;}
+function renderStage2Result(result){
+  eventStage2Cache[result.event_summary.sample_id]=result;
+  selectedAssessmentId=result.event_summary.sample_id;
+  document.getElementById('eventGeminiReport').innerHTML='';
+  const ev=result.event_summary;
+  document.getElementById('stage2Summary').innerHTML=`<div class="report-section"><h4>${esc(ev.event_title)} · ${esc(ev.sample_id)}</h4><p>${esc(ev.hazard_type)} · ${esc(ev.event_date)} · ${Number(ev.latitude).toFixed(4)}, ${Number(ev.longitude).toFixed(4)}</p><p><strong>${Number(result.total_places_screened||0)}</strong> listed places screened within ${Number(result.query_execution_log?.radius_meters||5000)/1000} km. API status: ${esc(result.query_execution_log?.status||'unknown')}. ${result.cached?'Reused cached results; no Places request made.':'Fresh Places results saved.'}</p><p>${esc(result.routing_execution_log?.message||'No route/closure determination available.')}</p></div>`;
+  const assets=result.screened_places||[];
+  document.getElementById('stage2Assets').innerHTML=assets.map(a=>`<div class="assessment-asset"><div class="assessment-asset-head"><strong>${Number(a.rank)||''}. ${esc(a.asset_name)} <span style="color:var(--muted);font-weight:500">· ${esc(a.asset_type)}</span></strong><span class="priority-pill">${esc(a.screening_priority)}</span></div><p>${Number(a.distance_to_event_km).toFixed(2)} km from event point · ${esc(a.facility_class)}${a.formatted_address?' · '+esc(a.formatted_address):''}</p></div>`).join('')||'<div class="event-empty">Google returned no listed places for the configured facility types. This does not imply infrastructure is absent.</div>';
+  clearStage2Markers();
+  if(googleMapReady&&map){
+    const bounds=new google.maps.LatLngBounds();
+    const eventPosition={lat:Number(ev.latitude),lng:Number(ev.longitude)};
+    const eventMarker=new google.maps.Marker({map,position:eventPosition,title:ev.event_title,icon:{path:google.maps.SymbolPath.CIRCLE,scale:9,fillColor:'#ff7777',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
+    const eventInfo=new google.maps.InfoWindow({content:`<div style="font:12px Manrope,Arial;color:#172326"><b>${esc(ev.event_title)}</b><br>Selected event · Stage 2 reference point<br><small>Proximity screening only</small></div>`});
+    eventMarker.addListener('click',()=>eventInfo.open({map,anchor:eventMarker}));stage2Markers.push(eventMarker);bounds.extend(eventPosition);
+    assets.forEach(a=>{const pos={lat:Number(a.latitude),lng:Number(a.longitude)};const color=String(a.screening_priority||'').startsWith('High')?'#ff7777':String(a.screening_priority||'').startsWith('Medium')?'#ffb36b':'#82c7ef';const marker=new google.maps.Marker({map,position:pos,title:a.asset_name,icon:{path:google.maps.SymbolPath.CIRCLE,scale:6,fillColor:color,fillOpacity:.95,strokeColor:'#fff',strokeWeight:1}});const info=new google.maps.InfoWindow({content:`<div style="font:12px Manrope,Arial;color:#172326;line-height:1.55"><b>${esc(a.asset_name)}</b><br>${esc(a.asset_type)}<br>Distance: ${Number(a.distance_to_event_km).toFixed(2)} km<br>${esc(a.screening_priority)}<br><small>Not confirmed exposure/damage</small></div>`});marker.addListener('click',()=>info.open({map,anchor:marker}));stage2Markers.push(marker);bounds.extend(pos);});
+    map.fitBounds(bounds,70);
+  }
+  setAssessmentStatus(`Stage 2 ready for ${ev.sample_id}. Distances and priority bands are calculated by the backend. These are proximity-screening results, not confirmed damage or a modeled hazard footprint.`);
+}
+function renderEventGemini(report){
+  const root=document.getElementById('eventGeminiReport');
+  const rows=(report.ranked_assets||[]).map(a=>`<div class="assessment-asset"><div class="assessment-asset-head"><strong>${Number(a.rank)||''}. ${esc(a.asset_name)}</strong><span class="priority-pill">${esc(a.screening_priority)}</span></div><p>${Number(a.distance_to_event_km).toFixed(2)} km · ${esc(a.gemini_explanation||'No explanation returned.')}</p></div>`).join('');
+  const priorities=(report.emergency_response_priorities||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+  const limitations=(report.limitations||[]).map(x=>`<li>${esc(x)}</li>`).join('');
+  root.innerHTML=`<div class="report-section"><h4>Gemini situation summary</h4><p>${esc(report.situation||'')}</p><p>${esc(report.situation_report||'')}</p></div><div class="report-section"><h4>Ranked places + evidence explanations</h4>${rows||'<p>No places were returned by Stage 2.</p>'}</div><div class="report-section"><h4>Response-review priorities</h4><ul>${priorities||'<li>No additional priorities returned.</li>'}</ul></div><div class="report-section"><h4>Road closures / routes</h4><p>${esc(report.road_closure_and_route_status||'No route or closure determination available.')}</p></div><div class="report-section"><h4>Limitations</h4><ul>${limitations}</ul></div>`;
+}
+async function runEventAction(sampleId,action,button){
+  const title=historyData.find(e=>(e.sample_id||e.id)===sampleId)?.title||sampleId;
+  selectedAssessmentId=sampleId;
+  document.getElementById('eventAssessmentPanel').scrollIntoView({behavior:'smooth',block:'start'});
+  const old=button.textContent;button.disabled=true;button.textContent=action==='stage2'?'Searching…':'Generating…';
+  setAssessmentStatus(`${action==='stage2'?'Retrieving Google Places for':'Generating the Gemini report for'} ${title}…`);
+  try{
+    // On a page reload, hydrate a previously saved Stage 2 record before Gemini runs.
+    // This GET reads cache only and does not make a Google Places request.
+    if(action==='gemini' && !eventStage2Cache[sampleId]){
+      const cachedResponse=await fetch(`/api/events/${encodeURIComponent(sampleId)}/stage2`);
+      const cachedData=await cachedResponse.json();
+      if(!cachedResponse.ok)throw new Error(cachedData.detail||`Saved Stage 2 lookup failed (HTTP ${cachedResponse.status})`);
+      if(!cachedData.available||!cachedData.result){
+        stage2StatusByEvent[sampleId]=false;
+        throw new Error('No saved Stage 2 result is available. Run Stage 2 for this event first.');
+      }
+      renderStage2Result(cachedData.result);
+      stage2StatusByEvent[sampleId]=true;
+    }
+    const r=await fetch(`/api/events/${encodeURIComponent(sampleId)}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const data=await r.json();
+    if(!r.ok){
+      if(action==='gemini' && r.status===409)stage2StatusByEvent[sampleId]=false;
+      throw new Error(data.detail||data.error||`Request failed with HTTP ${r.status}`);
+    }
+    const result=data.result;
+    if(action==='stage2'){
+      renderStage2Result(result);
+      stage2StatusByEvent[sampleId]=true;
+    }else{
+      renderEventGemini(result);
+      stage2StatusByEvent[sampleId]=true;
+      setAssessmentStatus(`Gemini report ready for ${sampleId}. Model: ${result.model||'configured Gemini model'}. Gemini explains the supplied calculations; it does not change them.`);
+    }
+  }catch(e){
+    if(action==='stage2' && !eventStage2Cache[sampleId])stage2StatusByEvent[sampleId]=false;
+    setAssessmentStatus(`${action==='stage2'?'Stage 2':'Gemini'} failed for ${sampleId}: ${e.message}`);
+  }finally{
+    button.disabled=false;button.textContent=old;
+    rerenderHistoryListPreservingScroll();
+  }
+}
+document.getElementById('historyList').addEventListener('click',ev=>{
+  const button=ev.target.closest('button[data-event-action]');if(!button)return;
+  const sampleId=button.dataset.sampleId;if(!sampleId){setAssessmentStatus('This historical record has no sample ID, so it cannot be assessed.');return;}
+  runEventAction(sampleId,button.dataset.eventAction,button);
+});
+document.getElementById('historySearch').addEventListener('input',renderHistoryList);
+
 function renderGeminiMarkdown(md) {
   const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   return md.split(/\n/).map(line => {
