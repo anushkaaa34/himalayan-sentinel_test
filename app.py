@@ -1,10 +1,12 @@
-import os, json, math, traceback
-from datetime import date, timedelta
+import os, json, math, traceback, threading, hashlib, re, uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta, datetime, timezone, time as datetime_time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +15,404 @@ import joblib
 import ee
 from html import escape
 from urllib.parse import quote
+from pydantic import BaseModel, Field
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env")
 GEE_PROJECT=os.getenv("GEE_PROJECT", "ai-builder-cup-510010")
+GOOGLE_MAPS_API_KEY=os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+GOOGLE_MAPS_BROWSER_KEY=os.getenv("GOOGLE_MAPS_BROWSER_KEY", "").strip() or GOOGLE_MAPS_API_KEY
+GEMINI_API_KEY=os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GCS_BUCKET=os.getenv("GCS_BUCKET", "").strip()
+STAGE2_RADIUS_METERS=int(os.getenv("STAGE2_RADIUS_METERS", "5000"))
+STAGE2_DAILY_REQUEST_BUDGET=int(os.getenv("STAGE2_DAILY_REQUEST_BUDGET", "70"))
+CACHE_ROOT=ROOT/"data"/"event_assessment_cache"
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+STAGE2_REQUEST_LOCK=threading.RLock()
+_GCS_CLIENT=None
+
+# One combined Places Nearby Search call per event; Demo Key quotas can be exhausted.
+# This conservative in-app budget is configurable and persisted with the optional GCS bucket.
+STAGE2_PLACE_TYPES=[
+    "hospital", "medical_clinic", "school", "university", "fire_station",
+    "police", "transit_station", "train_station", "local_government_office",
+    "pharmacy", "lodging"
+]
+STAGE2_PLACES_URL="https://places.googleapis.com/v1/places:searchNearby"
+STAGE2_CRITICAL_TYPES=set(STAGE2_PLACE_TYPES)-{"lodging"}
+STAGE2_PACIFIC=ZoneInfo("America/Los_Angeles")
+
+
+def _slug(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")[:100] or "unknown"
+
+
+def _local_cache_path(key):
+    """Return the canonical local cache path without duplicating a .json suffix."""
+    clean=str(key).replace("\\", "/").strip("/")
+    if not clean.lower().endswith(".json"):
+        clean += ".json"
+    return CACHE_ROOT / clean
+
+
+def _legacy_local_cache_path(key):
+    """Compatibility path for results written by older code as *.json.json."""
+    clean=str(key).replace("\\", "/").strip("/")
+    return CACHE_ROOT / (clean + ".json")
+
+
+def _get_gcs_client():
+    global _GCS_CLIENT
+    if _GCS_CLIENT is None:
+        from google.cloud import storage
+        _GCS_CLIENT=storage.Client()
+    return _GCS_CLIENT
+
+
+def _read_cache(key):
+    """Read JSON cache locally for development, or from GCS when GCS_BUCKET is configured."""
+    if GCS_BUCKET:
+        try:
+            blob=_get_gcs_client().bucket(GCS_BUCKET).blob("himalayan-sentinel/"+key.strip("/"))
+            # Download directly (instead of exists()+download) so each status lookup
+            # requires one storage read. A missing object means no cached result.
+            try:
+                content=blob.download_as_text(encoding="utf-8")
+            except Exception as exc:
+                if type(exc).__name__ == "NotFound" or getattr(exc, "code", None) == 404:
+                    return None
+                raise
+            return json.loads(content)
+        except Exception as exc:
+            raise RuntimeError(f"Could not read shared GCS cache ({GCS_BUCKET}): {exc}") from exc
+    path=_local_cache_path(key)
+    if not path.exists():
+        legacy=_legacy_local_cache_path(key)
+        if legacy != path and legacy.exists():
+            path=legacy
+        else:
+            return None
+    try: return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc: raise RuntimeError(f"Cache file is unreadable: {path}: {exc}") from exc
+
+
+def _write_cache(key, value):
+    payload=json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    if GCS_BUCKET:
+        try:
+            blob=_get_gcs_client().bucket(GCS_BUCKET).blob("himalayan-sentinel/"+key.strip("/"))
+            blob.upload_from_string(payload, content_type="application/json; charset=utf-8")
+            return
+        except Exception as exc:
+            raise RuntimeError(f"Could not write shared GCS cache ({GCS_BUCKET}): {exc}") from exc
+    path=_local_cache_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp=path.with_suffix(path.suffix+".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _event_cache_signature(event):
+    body={"sample_id":event["sample_id"],"lat":event["latitude"],"lon":event["longitude"],
+          "title":event["event_title"],"hazard":event["hazard_type"],"date":event["event_date"],
+          "radius":STAGE2_RADIUS_METERS,"types":STAGE2_PLACE_TYPES,"api":"places-v1"}
+    return hashlib.sha256(json.dumps(body,sort_keys=True).encode()).hexdigest()
+
+
+def _event_from_dataset(sample_id):
+    if "sample_id" not in df.columns or "sample_type" not in df.columns:
+        raise HTTPException(status_code=500, detail="Dataset must contain sample_id and sample_type columns.")
+    mask=df["sample_id"].astype(str).eq(str(sample_id)) & df["sample_type"].astype(str).str.lower().eq("event")
+    rows=df.loc[mask]
+    if rows.empty:
+        raise HTTPException(status_code=404, detail="This event ID was not found among event records. Control rows cannot be assessed.")
+    row=rows.iloc[0]
+    try:
+        lat=float(row.get("latitude")); lon=float(row.get("longitude"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="This event has no valid latitude/longitude.")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise HTTPException(status_code=422, detail="Event coordinates are outside valid bounds.")
+    def val(k, default=""):
+        v=row.get(k, default)
+        if v is None or pd.isna(v) or str(v).strip().lower() in {"", "nan", "none", "nat"}: return default
+        return str(v).strip()
+    return {
+        "sample_id":str(sample_id), "event_id":val("event_id", str(sample_id)),
+        "event_title":val("event_title", str(sample_id)),
+        "latitude":lat, "longitude":lon,
+        "hazard_type":val("landslide_category", val("hazard_type", "unknown_hazard")),
+        "event_date":val("event_day", val("target_start", "Unknown")),
+        "country_name":val("country_name", "Unknown"),
+        "source_name":val("source_name", ""),
+        "source_link":val("source_link", ""),
+        "sample_type":"event",
+        "model_score":None,
+    }
+
+
+def _distance_km(lat1, lon1, lat2, lon2):
+    # Haversine great-circle distance. The output is a proximity metric, not a hazard footprint.
+    r=6371.0088
+    p1,p2=math.radians(lat1),math.radians(lat2)
+    dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+    a=math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*r*math.asin(min(1.0, math.sqrt(a)))
+
+
+def _screening_priority(distance_km):
+    if distance_km <= 1: return "High proximity review", 0
+    if distance_km <= 3: return "Medium proximity review", 1
+    return "Low proximity review", 2
+
+
+def _pacific_day():
+    return datetime.now(STAGE2_PACIFIC).date().isoformat()
+
+
+def _next_pacific_midnight():
+    now=datetime.now(STAGE2_PACIFIC)
+    tomorrow=now.date()+timedelta(days=1)
+    return datetime.combine(tomorrow, datetime_time.min, tzinfo=STAGE2_PACIFIC).isoformat()
+
+
+def _read_places_block():
+    try: return _read_cache("stage2/quota_block.json")
+    except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+
+
+def _reserve_places_request():
+    blocked=_read_places_block()
+    if blocked:
+        try:
+            until=datetime.fromisoformat(blocked.get("blocked_until", ""))
+            if datetime.now(timezone.utc) < until.astimezone(timezone.utc):
+                raise HTTPException(status_code=429, detail="Google Places requests are paused after a quota error until the next Pacific midnight. Existing cached results remain available.")
+        except ValueError:
+            pass
+    day=_pacific_day()
+    key=f"stage2/usage/places-{day}.json"
+    try: usage=_read_cache(key) or {"day":day,"count":0}
+    except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+    count=int(usage.get("count",0))
+    if count >= STAGE2_DAILY_REQUEST_BUDGET:
+        raise HTTPException(status_code=429, detail=f"Stage 2 reached its configured daily request budget ({STAGE2_DAILY_REQUEST_BUDGET}) for Pacific date {day}. Cached results still work; retry after the quota reset.")
+    usage.update({"day":day,"count":count+1,"last_reserved_utc":datetime.now(timezone.utc).isoformat()})
+    try: _write_cache(key, usage)
+    except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+
+
+def _record_places_quota_block(message):
+    try:
+        _write_cache("stage2/quota_block.json", {"blocked_at_utc":datetime.now(timezone.utc).isoformat(),
+            "blocked_until":_next_pacific_midnight(),"reason":str(message)[:500]})
+    except Exception:
+        pass
+
+
+def _fetch_stage2_result(event):
+    if not GOOGLE_MAPS_API_KEY:
+        raise HTTPException(status_code=503, detail="Set GOOGLE_MAPS_API_KEY in .env / Cloud Run environment to enable Stage 2.")
+    signature=_event_cache_signature(event)
+    cache_key=f"stage2/events/{_slug(event['sample_id'])}.json"
+    try: cached=_read_cache(cache_key)
+    except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+    if cached and cached.get("cache_signature")==signature:
+        cached["cached"]=True
+        return cached
+
+    # Enforce a single in-flight Google Places call per app instance.
+    with STAGE2_REQUEST_LOCK:
+        try: cached=_read_cache(cache_key)
+        except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+        if cached and cached.get("cache_signature")==signature:
+            cached["cached"]=True
+            return cached
+        _reserve_places_request()
+        payload={
+            "includedTypes":STAGE2_PLACE_TYPES,
+            "maxResultCount":20,
+            "rankPreference":"DISTANCE",
+            "locationRestriction":{"circle":{"center":{"latitude":event["latitude"],"longitude":event["longitude"]},"radius":float(STAGE2_RADIUS_METERS)}}
+        }
+        headers={"Content-Type":"application/json","X-Goog-Api-Key":GOOGLE_MAPS_API_KEY,
+                 "X-Goog-FieldMask":"places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.types"}
+        try:
+            response=requests.post(STAGE2_PLACES_URL,headers=headers,json=payload,timeout=25)
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Google Places request failed before a response: {exc}")
+        try: body=response.json()
+        except ValueError: body={}
+        if response.status_code == 429:
+            msg=body.get("error",{}).get("message", "Google Places daily quota exceeded (HTTP 429).")
+            _record_places_quota_block(msg)
+            raise HTTPException(status_code=429, detail=f"{msg} Stage 2 is paused until the next Pacific midnight to avoid repeated failed requests.")
+        if not response.ok:
+            msg=body.get("error",{}).get("message",response.text[:500] or "Unknown Google Places error")
+            raise HTTPException(status_code=502, detail=f"Google Places returned HTTP {response.status_code}: {msg}")
+
+        places=[]
+        for place in body.get("places",[]):
+            loc=place.get("location") or {}
+            if "latitude" not in loc or "longitude" not in loc: continue
+            p_lat=float(loc["latitude"]); p_lon=float(loc["longitude"])
+            dist=_distance_km(event["latitude"],event["longitude"],p_lat,p_lon)
+            if dist > STAGE2_RADIUS_METERS/1000.0 + 0.05: continue
+            primary=place.get("primaryType") or "unknown"
+            place_types=place.get("types") or [primary]
+            critical=bool(set(place_types).intersection(STAGE2_CRITICAL_TYPES))
+            priority, priority_rank=_screening_priority(dist)
+            places.append({
+                "asset_id":str(place.get("id") or ""),
+                "asset_name":(place.get("displayName") or {}).get("text") or "Unnamed Google place",
+                "asset_type":primary.replace("_"," ").title(),
+                "facility_class":"Potential critical/public service" if critical else "Other listed place",
+                "google_primary_type":primary,"google_types":place_types,
+                "formatted_address":place.get("formattedAddress") or "",
+                "latitude":p_lat,"longitude":p_lon,"data_source":"Google Places API (New)",
+                "distance_to_event_km":round(dist,3),
+                "screening_priority":priority,"_priority_rank":priority_rank,
+                "distance_method":"Haversine great-circle point-to-point",
+                "interpretation":"Proximity screening only; this does not confirm exposure or damage."
+            })
+        places.sort(key=lambda x:(x["_priority_rank"],x["distance_to_event_km"],x["asset_name"].casefold()))
+        for idx,place in enumerate(places,1):
+            place["rank"]=idx
+            place.pop("_priority_rank",None)
+        query_log={
+            "provider_policy":"Google Places API (New) only; no OSM/OpenStreetMap fallback",
+            "status":"Success (Results Returned)" if places else "Success (Zero Results)",
+            "http_status":response.status_code,"request_count":1,"result_count":len(places),
+            "radius_meters":STAGE2_RADIUS_METERS,"max_results_per_event":20,
+            "searched_types":STAGE2_PLACE_TYPES,"error_message":None,
+            "daily_budget":STAGE2_DAILY_REQUEST_BUDGET,
+            "note":"Places results are current Google listings, not a complete GIS inventory or an event-date inventory."
+        }
+        result={
+            "ok":True,"stage":"stage2","cache_signature":signature,"cached":False,
+            "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+            "event_summary":event,"query_execution_log":query_log,
+            "assessment_mode":"Google Places proximity screening",
+            "total_places_retrieved":len(places),"total_places_screened":len(places),
+            "screened_places":places,
+            "routing_execution_log":{"status":"Not calculated","message":"No validated route origin, road-closure observations, or hazard footprint was supplied. No route safety or closure claim is made."},
+            "limitations":[
+                "These results are current Google Places listings and may not match infrastructure present on the historical event date.",
+                "Google Places is not a complete inventory of roads, bridges, settlements, buildings, or infrastructure.",
+                "Distance from a single event point is a screening metric, not a physical runout, flood, or inundation footprint.",
+                "A proximity priority is not a probability of damage, a closure determination, or an evacuation recommendation."
+            ]
+        }
+        try: _write_cache(cache_key,result)
+        except Exception as exc: raise HTTPException(status_code=503, detail=f"Places results were retrieved, but cache write failed: {exc}")
+        return result
+
+
+class AssetExplanation(BaseModel):
+    asset_id: str = Field(description="Must exactly match an asset_id provided in the input evidence.")
+    explanation: str = Field(description="A concise explanation based only on the supplied type, distance, and proximity screening band.")
+
+class GeminiEventNarrative(BaseModel):
+    situation: str = Field(description="Brief evidence-grounded event summary; do not assert damage.")
+    asset_explanations: list[AssetExplanation] = Field(description="Explanations only for input asset IDs; do not invent assets or distances.")
+    emergency_response_priorities: list[str] = Field(description="Cautious verification/preparedness tasks, not orders or unverified claims.")
+    road_closure_and_route_status: str = Field(description="State only what route/closure evidence is supplied; if none, say no route/closure determination is available.")
+    situation_report: str = Field(description="Readable concise situation report with limitations included.")
+    limitations: list[str] = Field(description="Important data and inference limitations.")
+
+
+class AssessmentStatusRequest(BaseModel):
+    sample_ids: list[str] = Field(default_factory=list, description="Event sample IDs whose saved Stage 2 status should be checked.")
+
+
+def _gemini_event_result(stage2):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Set GEMINI_API_KEY to enable Gemini reports.")
+    if genai is None or genai_types is None:
+        raise HTTPException(status_code=503, detail="Install the current Google Gen AI SDK: python -m pip install google-genai")
+    event=stage2["event_summary"]
+    cache_sig=hashlib.sha256((stage2.get("cache_signature","")+GEMINI_MODEL).encode()).hexdigest()
+    cache_key=f"stage3/events/{_slug(event['sample_id'])}-{cache_sig[:16]}.json"
+    try: cached=_read_cache(cache_key)
+    except Exception as exc: raise HTTPException(status_code=503, detail=str(exc))
+    if cached:
+        cached["cached"]=True
+        return cached
+
+    evidence=[]
+    for p in stage2.get("screened_places",[])[:20]:
+        evidence.append({k:p.get(k) for k in ["asset_id","asset_name","asset_type","facility_class","google_primary_type","formatted_address","distance_to_event_km","screening_priority","rank"]})
+    route_info=stage2.get("routing_execution_log") or {"status":"Not calculated"}
+    prompt=(
+      "You are the report-writing layer of a Himalayan multi-hazard research decision-support prototype. "
+      "Interpret the provided calculated evidence; do not recalculate or invent measurements. "
+      "Do not claim an asset is damaged or inside a hazard footprint. The input screening rank is deterministically derived from supplied point-to-point distance bands. "
+      "Use asset IDs only from the provided list. Explain why listed places were flagged using their supplied place type and distance. "
+      "Recommendations must be verification/preparedness tasks, not emergency orders. "
+      "No road closures, alternative routes, or route safety data are available unless explicitly present in routing evidence; if absent, say no determination is available. "
+      "Mention that Google Places is incomplete and its current listings may not represent the event date. "
+      "Return only the required JSON schema.\n\nEVENT EVIDENCE:\n"+
+      json.dumps({"event":event,"screened_places":evidence,"routing_evidence":route_info,"stage2_limitations":stage2.get("limitations",[])},ensure_ascii=False)
+    )
+    try:
+        client=genai.Client(api_key=GEMINI_API_KEY)
+        response=client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=GeminiEventNarrative,
+                temperature=0.2,
+                max_output_tokens=2600,
+            ),
+        )
+        parsed=getattr(response,"parsed",None)
+        if isinstance(parsed,GeminiEventNarrative):
+            narrative=parsed.model_dump()
+        elif isinstance(parsed,dict):
+            narrative=GeminiEventNarrative.model_validate(parsed).model_dump()
+        else:
+            response_text=getattr(response,"text",None)
+            if not response_text: raise ValueError("Gemini returned an empty structured response.")
+            narrative=GeminiEventNarrative.model_validate_json(response_text).model_dump()
+    except HTTPException: raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini report generation failed: {str(exc)[:400]}")
+
+    allowed={p.get("asset_id") for p in stage2.get("screened_places",[])}
+    explanation_map={}
+    for item in narrative.get("asset_explanations",[]):
+        aid=item.get("asset_id")
+        if aid in allowed and aid not in explanation_map:
+            explanation_map[aid]=str(item.get("explanation", ""))[:1000]
+    ranked_assets=[]
+    for place in stage2.get("screened_places",[]):
+        clean={k:v for k,v in place.items() if not k.startswith("_")}
+        clean["gemini_explanation"]=explanation_map.get(place.get("asset_id"),"Gemini supplied no asset-specific explanation for this record; use the Stage 2 measurements only.")
+        ranked_assets.append(clean)
+    report={
+        "ok":True,"stage":"stage3","cached":False,"generated_at_utc":datetime.now(timezone.utc).isoformat(),
+        "model":GEMINI_MODEL,"event_summary":event,
+        "situation":narrative.get("situation",""),
+        "ranked_assets":ranked_assets,
+        "emergency_response_priorities":narrative.get("emergency_response_priorities",[]),
+        "road_closure_and_route_status":narrative.get("road_closure_and_route_status","No route or closure determination is available."),
+        "situation_report":narrative.get("situation_report",""),
+        "limitations":list(dict.fromkeys(stage2.get("limitations",[])+narrative.get("limitations",[]))),
+        "evidence_policy":"Ranks, IDs, facility details, coordinates and distances come from Stage 2. Gemini supplies explanations only; invalid asset IDs are dropped."
+    }
+    try: _write_cache(cache_key,report)
+    except Exception as exc: raise HTTPException(status_code=503, detail=f"Gemini returned a report, but cache write failed: {exc}")
+    return report
+
 try:
     ee.Initialize(project=GEE_PROJECT)
     GEE_READY=True
@@ -314,7 +710,7 @@ def fetch_site(site):
 @app.get("/", response_class=HTMLResponse)
 def home():
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+    maps_key = GOOGLE_MAPS_BROWSER_KEY
     key_literal = json.dumps(maps_key).replace("<", "\\u003c")
     html = html.replace("'YOUR_GOOGLE_MAPS_API_KEY'", key_literal)
     maps_script = ""
@@ -333,10 +729,10 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"ok":True,"model":type(model).__name__,"expected_features":len(FEATURES),"dataset_rows":len(df),"events":int((df.sample_type=="event").sum()),"controls":int((df.sample_type=="control").sum()),"gee_ready":GEE_READY,"gee_error":GEE_ERROR,"gee_project":GEE_PROJECT}
+    return {"ok":True,"model":type(model).__name__,"expected_features":len(FEATURES),"dataset_rows":len(df),"events":int((df.sample_type=="event").sum()),"controls":int((df.sample_type=="control").sum()),"gee_ready":GEE_READY,"gee_error":GEE_ERROR,"gee_project":GEE_PROJECT,"stage2_enabled":bool(GOOGLE_MAPS_API_KEY),"gemini_enabled":bool(GEMINI_API_KEY and genai is not None),"cache_backend":"google_cloud_storage" if GCS_BUCKET else "local_ephemeral_or_development","gcs_bucket_configured":bool(GCS_BUCKET)}
 
 @app.get("/api/history")
-def history(years:int=Query(default=10,ge=1,le=20),limit:int=Query(default=1500,ge=1,le=5000)):
+def history(years:int=Query(default=10,ge=1,le=100),limit:int=Query(default=1500,ge=1,le=5000)):
     # Historical catalog records are displayed as records, never passed through the predictor.
     events=df[df["sample_type"].astype(str).str.lower().eq("event")].copy()
     date_col="event_day" if "event_day" in events else "target_start"
@@ -346,8 +742,10 @@ def history(years:int=Query(default=10,ge=1,le=20),limit:int=Query(default=1500,
     out=[]
     for _,r in events.iterrows():
         if pd.isna(r.get("latitude")) or pd.isna(r.get("longitude")): continue
-        out.append({"date":r["_date"].date().isoformat(),"lat":float(r["latitude"]),"lon":float(r["longitude"]),
-          "title":str(r.get("event_title") or "Catalogued landslide"),"country":str(r.get("country_name") or ""),
+        out.append({"id":str(r.get("sample_id") or ""),"sample_id":str(r.get("sample_id") or ""),
+          "date":r["_date"].date().isoformat(),"lat":float(r["latitude"]),"lon":float(r["longitude"]),
+          "title":str(r.get("event_title") or "Catalogued landslide"),
+          "hazard_type":str(r.get("landslide_category") or "unknown_hazard"),"country":str(r.get("country_name") or ""),
           "source":str(r.get("source_name") or ""),"url":str(r.get("source_link") or ""),
           "status":str(r.get("provisional_status") or "Unreviewed catalogue candidate"),
           "quality":str(r.get("label_quality_tier") or "Unverified candidate")})
@@ -381,62 +779,96 @@ def live():
 
 @app.post("/api/gemini")
 def gemini(payload:dict):
-    key=os.getenv("GEMINI_API_KEY")
-    if not key: return {"ok":False,"error":"Set GEMINI_API_KEY in .env to enable Gemini summaries."}
-    # Send only compact prediction results; Gemini explains outputs and must not alter model scores.
+    """Existing dashboard site-score brief, now using the Google Gen AI SDK."""
+    if not GEMINI_API_KEY:
+        return {"ok":False,"error":"Set GEMINI_API_KEY in .env / Cloud Run environment to enable Gemini summaries."}
+    if genai is None or genai_types is None:
+        return {"ok":False,"error":"Install the current Google Gen AI SDK: python -m pip install google-genai"}
     results=payload.get("results",[])[:20]
     source_context=(
-        "The input is an offline replay of historical examples from the dataset's designated test split, not current sites or conditions. "
-        "Do not frame these as current risks or recommend current-site actions. "
+        "The input is offline replay of historical examples from the dataset's designated test split, not current sites or conditions. Do not frame it as current risk. "
         if payload.get("demo_only") else
-        "The input contains current provider-derived site scores, but they are experimental research outputs, not warnings. "
+        "The input contains current provider-derived site scores, which are experimental uncalibrated research outputs, not warnings. "
     )
-    prompt=("Write a complete, concise analyst brief for a Himalayan hazard research dashboard in at most 140 words. "
-      "Use three short sections: Situation; Sites to review (up to three, ranked only by model score); "
-      "Limitations and verification. Explain that scores are uncalibrated research outputs, not official warnings. "
-      "Historical events are past records, not predictions. "+source_context+
-      "Mention data completeness/lag only when provided. "
-      "Do not invent causes, observations, or certainty. Finish every sentence and include the human verification recommendation. "
-      "Prediction data: "+json.dumps(results,ensure_ascii=False))
+    prompt=("Write a concise analyst brief for a Himalayan hazard research dashboard in at most 140 words. "
+        "Use three short sections: Situation; Sites to review (up to three, ranked only by supplied model score); Limitations and verification. "
+        "Do not invent causes, field observations, closures, measurements or certainty. Mention scores are uncalibrated research outputs, not official warnings. "
+        +source_context+"Prediction data: "+json.dumps(results,ensure_ascii=False))
     try:
-        
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
-        resp = requests.post(
-            url,
-            headers={
-                "x-goog-api-key": key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 2048,
-                },
-            },
-            timeout=45,
+        client=genai.Client(api_key=GEMINI_API_KEY)
+        response=client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+            config=genai_types.GenerateContentConfig(temperature=0.2,max_output_tokens=700),
         )
-        resp.raise_for_status()
-        body = resp.json()
-        candidates = body.get("candidates", [])
-        if not candidates:
-            block_reason = body.get("promptFeedback", {}).get("blockReason")
-            detail = f"Gemini did not return a report. Block reason: {block_reason}." if block_reason else "Gemini did not return a report."
-            return {"ok": False, "error": detail}
-        candidate = candidates[0]
-        text = "".join(part.get("text", "") for part in candidate.get("content", {}).get("parts", []))
-        if not text:
-            return {"ok": False, "error": "Gemini returned no report text."}
-        finish_reason = candidate.get("finishReason", "UNKNOWN")
-        return {
-            "ok": True,
-            "summary": text,
-            "model": "gemini-flash-latest",
-            "complete": finish_reason == "STOP",
-            "finish_reason": finish_reason,
-        }
-
+        text=getattr(response,"text",None)
+        if not text: return {"ok":False,"error":"Gemini returned an empty brief."}
+        return {"ok":True,"summary":text,"model":GEMINI_MODEL,"complete":True,"finish_reason":"STOP"}
     except Exception as e:
-        return {"ok":False,"error":"Gemini request failed: "+str(e)[:240]}
+        return {"ok":False,"error":"Gemini request failed: "+str(e)[:300]}
+
+
+@app.post("/api/events/assessment-status")
+def event_assessment_status(payload:AssessmentStatusRequest):
+    """Batch-check saved Stage 2 results so the UI can gate each Gemini button without Places calls."""
+    raw_ids=payload.sample_ids or []
+    if len(raw_ids) > 1500:
+        raise HTTPException(status_code=413, detail="Check at most 1500 event IDs per status request.")
+    sample_ids=list(dict.fromkeys(str(x).strip() for x in raw_ids if str(x).strip()))
+
+    def check_one(sample_id):
+        try:
+            event=_event_from_dataset(sample_id)
+            signature=_event_cache_signature(event)
+            cached=_read_cache(f"stage2/events/{_slug(sample_id)}.json")
+            available=bool(cached and cached.get("cache_signature")==signature and cached.get("ok") is True)
+            return {"sample_id":sample_id,"stage2_available":available,
+                    "generated_at_utc":cached.get("generated_at_utc") if available else None,
+                    "places_count":cached.get("total_places_screened",0) if available else 0,
+                    "error":None}
+        except HTTPException as exc:
+            return {"sample_id":sample_id,"stage2_available":False,"generated_at_utc":None,
+                    "places_count":0,"error":exc.detail}
+        except Exception as exc:
+            return {"sample_id":sample_id,"stage2_available":False,"generated_at_utc":None,
+                    "places_count":0,"error":str(exc)[:240]}
+
+    # Parallel cache reads make this one frontend request even for the full event list.
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        items=list(pool.map(check_one, sample_ids))
+    return {"ok":True,"count":len(items),"items":items}
+
+
+@app.post("/api/events/{sample_id}/stage2")
+def event_stage2(sample_id:str):
+    """Generate or reuse Stage 2 for one event only; never starts a batch."""
+    event=_event_from_dataset(sample_id)
+    result=_fetch_stage2_result(event)
+    return {"ok":True,"cached":bool(result.get("cached")),"result":result}
+
+
+@app.get("/api/events/{sample_id}/stage2")
+def get_event_stage2(sample_id:str):
+    """Return a previously cached Stage 2 result without spending a Places request."""
+    event=_event_from_dataset(sample_id)
+    signature=_event_cache_signature(event)
+    try: result=_read_cache(f"stage2/events/{_slug(sample_id)}.json")
+    except Exception as exc: raise HTTPException(status_code=503,detail=str(exc))
+    if not result or result.get("cache_signature") != signature:
+        return {"ok":True,"available":False,"result":None}
+    result["cached"]=True
+    return {"ok":True,"available":True,"result":result}
+
+
+@app.post("/api/events/{sample_id}/gemini")
+def event_gemini(sample_id:str):
+    """Generate or reuse an evidence-grounded Stage 3 report from cached Stage 2 results."""
+    event=_event_from_dataset(sample_id)
+    signature=_event_cache_signature(event)
+    try: stage2=_read_cache(f"stage2/events/{_slug(sample_id)}.json")
+    except Exception as exc: raise HTTPException(status_code=503,detail=str(exc))
+    if not stage2 or stage2.get("cache_signature") != signature:
+        raise HTTPException(status_code=409,detail="Run Stage 2 for this event first. Gemini only interprets saved Stage 2 calculations.")
+    report=_gemini_event_result(stage2)
+    return {"ok":True,"cached":bool(report.get("cached")),"result":report}
 
 app.mount("/static",StaticFiles(directory=ROOT/"static"),name="static")
