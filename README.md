@@ -40,35 +40,13 @@ uvicorn app:app --reload
 
 Open <http://127.0.0.1:8000>.
 
-## Deploy to Google Cloud Run (no Dockerfile)
+## Live app
 
-The service has been deployed from source using Google Cloud Buildpacks. From the project root:
+The app is already deployed on Google Cloud Run and is publicly accessible:
 
-```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com earthengine.googleapis.com
-gcloud run deploy himalayan-sentinel \
-  --source . \
-  --region asia-south1 \
-  --command="" \
-  --args="" \
-  --memory=2Gi \
-  --cpu=2 \
-  --timeout=300 \
-  --set-env-vars=GEE_PROJECT=YOUR_PROJECT_ID \
-  --allow-unauthenticated
-```
+**[Open Himalayan Sentinel](https://himalayan-sentinel-c2pfjge2na-el.a.run.app)**
 
-The empty `--command` and `--args` clear any previously saved container entrypoint overrides so the Buildpacks-provided Uvicorn startup command is used. Keep the root `.gcloudignore` in place so `.env`, `.venv`, and local files aren't uploaded.
-
-After deployment, configure runtime keys in **Cloud Run → service → Edit and deploy new revision → Variables & Secrets**:
-
-- `GOOGLE_MAPS_API_KEY`: Maps JavaScript API key. This is delivered to browsers to load the map; restrict it to the Maps JavaScript API and your service's HTTPS referrer, for example `https://YOUR-SERVICE-URL/*`.
-- `GEMINI_API_KEY`: Gemini API key. Prefer storing it in Secret Manager and mounting it as an environment variable on the service.
-- `GEE_PROJECT`: the Cloud project registered for Earth Engine.
-
-Deploy the new revision after changing variables or secrets. The Cloud Run runtime service account must be authorized to use Earth Engine in the configured project. If you choose `--allow-unauthenticated`, anyone with the service URL can access the app.
+Anyone with this URL can access the app; sign-in is not required. The service runs in `asia-south1`. Its health endpoint is available at [`/api/health`](https://himalayan-sentinel-c2pfjge2na-el.a.run.app/api/health).
 
 ## Data flow
 
@@ -100,15 +78,6 @@ Select **Offline demo** in the dashboard to load a deterministic set of 12 examp
 - `GET /api/evaluation` — retrospective test-split metrics and evaluation caveats.
 - `GET /api/demo-replay` — deterministic offline replay examples.
 - `POST /api/gemini` — optional Gemini summary of supplied results.
-
-## Suggested 90-second demo
-
-1. Introduce the community resilience problem and state clearly that this is a research prototype, not an alert service.
-2. Show the retrospective evaluation and disclose the model-provenance and matched-sample limitations.
-3. Refresh live data and inspect an example site's observation date, completeness, and raw score.
-4. Toggle historical catalogue events to show how past records remain separate from current environmental scoring.
-5. If providers fail, use the clearly labeled Offline demo replay; explain that its examples are historical.
-6. Generate the Gemini brief as a narrative summary, then close with the validation needed before real-world use.
 
 ## Earth Engine setup
 
